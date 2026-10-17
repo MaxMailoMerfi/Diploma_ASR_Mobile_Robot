@@ -1,6 +1,6 @@
 #include "esp_camera.h"
 
-// ========== Визначення пінів для AI Thinker ESP32-CAM ==========
+// ========== Визначення пінів камери AI Thinker ESP32-CAM ==========
 #define PWDN_GPIO_NUM 32
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM 0
@@ -18,32 +18,28 @@
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
-// ========== Параметри послідовного порту ==========
-// Використовуємо UART2, TX = GPIO12, RX не використовується (лише надсилання)
-// Підключення: GPIO12 -> Arduino RX (D0), спільний GND
+// ========== Налаштування послідовного порту (для зв'язку з Arduino) ==========
+// Використовуємо UART2, лише TX (GPIO12) -> RX Arduino, обов'язково з'єднати GND
 #define SERIAL_BAUD 115200
 
 // ========== Параметри розпізнавання ліній ==========
-#define SCAN_ROW_RATIO 0.75 // Сканування рядка на 3/4 висоти (ближче до нижньої частини)
-#define LINE_THRESHOLD 100  // Поріг темних пікселів (0-255), менше цього значення вважається лінією
+#define SCAN_ROW_RATIO 0.75 // Сканування рядка на 75% висоти зображення (ближче до нижньої частини)
+#define LINE_THRESHOLD 100  // Поріг темних пікселів: значення нижче цього вважається лінією
 #define IMAGE_WIDTH 320     // Ширина QVGA
 #define IMAGE_HEIGHT 240    // Висота QVGA
 #define CENTER_X (IMAGE_WIDTH / 2)
 
 // ========== Параметри керування ==========
-#define BASE_SPEED 80 // Базова швидкість руху
-#define KP 0.5f       // Пропорційний коефіцієнт
+#define BASE_SPEED 80 // Базова швидкість руху вперед
+#define KP 0.5f       // Пропорційний коефіцієнт (чим більше, тим чутливіше керування)
 #define MAX_STEER 60  // Максимальна різниця швидкості
-
-// ========== Глобальні змінні ==========
-int lastLinePos = CENTER_X; // Позиція лінії в попередньому кадрі (для фільтрації)
 
 void setup()
 {
     Serial.begin(115200);
-    Serial.println("ESP32-CAM Line Follower Starting...");
+    Serial.println("ESP32-CAM Line Follower Start...");
 
-    // Ініціалізація камери (режим сірого зображення)
+    // Ініціалізація камери (режим сірого зображення для максимальної швидкості)
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -64,38 +60,37 @@ void setup()
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
     config.xclk_freq_hz = 20000000;
-    config.pixel_format = PIXFORMAT_GRAYSCALE; // Сіре зображення для прискорення обробки
+    config.pixel_format = PIXFORMAT_GRAYSCALE; // Ключове: сіре зображення, швидша обробка
     config.frame_size = FRAMESIZE_QVGA;        // 320x240
     config.jpeg_quality = 12;
-    config.fb_count = 1; // Один буфер достатньо для покадрової обробки
+    config.fb_count = 1;
 
     esp_err_t err = esp_camera_init(&config);
     if (err != ESP_OK)
     {
-        Serial.printf("Camera init failed with error 0x%x\n", err);
+        Serial.printf("Camera init failed: 0x%x\n", err);
         return;
     }
 
-    // Ініціалізація UART2 для зв'язку з Arduino
-    Serial2.begin(SERIAL_BAUD, SERIAL_8N1, -1, 12); // TX = GPIO12
-    Serial.println("Camera ready. Line detection active.");
+    // Ініціалізація UART2, лише TX (GPIO12), RX не використовується
+    Serial2.begin(SERIAL_BAUD, SERIAL_8N1, -1, 12);
+    Serial.println("Camera Ready.");
 }
 
 void loop()
 {
-    // Захоплення кадру
+    // 1. Захоплення кадру
     camera_fb_t *fb = esp_camera_fb_get();
     if (!fb)
     {
-        Serial.println("Frame capture failed");
+        Serial.println("Capture Failed");
         return;
     }
 
-    // Сканування рядка для пошуку позиції лінії
+    // 2. Сканування одного рядка в нижній частині зображення для пошуку центру лінії
     int scanRow = (int)(IMAGE_HEIGHT * SCAN_ROW_RATIO);
     uint8_t *rowPtr = fb->buf + (scanRow * IMAGE_WIDTH);
 
-    // Обчислення центру мас темних пікселів (лінії)
     long weightedSum = 0;
     int darkPixelCount = 0;
 
@@ -103,40 +98,36 @@ void loop()
     {
         uint8_t pixel = rowPtr[x];
         if (pixel < LINE_THRESHOLD)
-        {                                     // Темний піксель = лінія
+        {                                     // Вважаємо темні пікселі лінією
             weightedSum += x * (255 - pixel); // Чим темніше, тим більша вага
             darkPixelCount++;
         }
     }
 
-    // Якщо знайдено достатньо темних пікселів, вважаємо, що лінію виявлено
-    int linePos = CENTER_X; // За замовчуванням у центрі
+    // 3. Обчислення позиції лінії
+    int linePos = CENTER_X; // Якщо лінію не знайдено, за замовчуванням центр (рух прямо)
     if (darkPixelCount > 5)
     {
         linePos = (int)(weightedSum / darkPixelCount);
     }
 
-    // Звільнення буфера кадру
-    esp_camera_fb_return(fb);
+    esp_camera_fb_return(fb); // Обов'язково звільнити буфер
 
-    // ========== Обчислення керуючої величини ==========
-    int error = linePos - CENTER_X; // Додатне = лінія праворуч, від'ємне = лінія ліворуч
-    int steer = (int)(error * KP);  // Пропорційне керування
-
-    // Обмеження максимальної різниці швидкості
+    // 4. Обчислення відхилення та команди керування
+    int error = linePos - CENTER_X; // Від'ємне = лінія ліворуч, додатне = праворуч
+    int steer = (int)(error * KP);
     steer = constrain(steer, -MAX_STEER, MAX_STEER);
 
-    // Розрахунок швидкості лівого та правого коліс
-    // Лінія праворуч -> правий поворот -> ліве колесо швидше, праве повільніше
-    int leftSpeed = BASE_SPEED + steer;
-    int rightSpeed = BASE_SPEED - steer;
+    // Лінія ліворуч -> потрібно повертати ліворуч -> праве колесо швидше, ліве повільніше
+    // (Конкретний напрямок залежить від монтажу, за потреби поміняйте місцями leftSpeed та rightSpeed)
+    int leftSpeed = BASE_SPEED - steer;
+    int rightSpeed = BASE_SPEED + steer;
 
-    // Обмеження діапазону швидкості [-127, 127]
     leftSpeed = constrain(leftSpeed, -127, 127);
     rightSpeed = constrain(rightSpeed, -127, 127);
 
-    // ========== Надсилання команди на Arduino ==========
-    // Формат пакету: 0xAA 0x55 leftSpeed rightSpeed (кожне 2 байти, int16_t)
+    // 5. Пакування та надсилання на Arduino
+    // Формат: 0xAA 0x55 [left_high] [left_low] [right_high] [right_low]
     uint8_t packet[6];
     packet[0] = 0xAA;
     packet[1] = 0x55;
@@ -147,9 +138,8 @@ void loop()
 
     Serial2.write(packet, 6);
 
-    // Відлагоджувальний вивід
-    Serial.printf("Line: %d, Error: %d, L: %d, R: %d\n",
-                  linePos, error, leftSpeed, rightSpeed);
+    // Відлагоджувальний вивід (можна переглянути через USB)
+    Serial.printf("Line:%d Err:%d L:%d R:%d\n", linePos, error, leftSpeed, rightSpeed);
 
-    delay(50); // Цикл ~20 Гц, достатньо для базового слідування
+    delay(50); // Частота циклу близько 20 Гц, достатньо для плавного руху
 }

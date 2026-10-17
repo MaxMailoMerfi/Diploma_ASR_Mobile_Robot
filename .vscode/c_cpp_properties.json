@@ -45,11 +45,11 @@
         "-IC:\\Users\\MaxMailoMerfi\\AppData\\Local\\Arduino15\\packages\\esp32\\tools\\esp32-libs\\3.3.12/qio_qspi/include",
         "-IC:\\Users\\MaxMailoMerfi\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.12\\cores\\esp32",
         "-IC:\\Users\\MaxMailoMerfi\\AppData\\Local\\Arduino15\\packages\\esp32\\hardware\\esp32\\3.3.12\\variants\\esp32",
-        "@d:\\Education\\Диплом_АСР_мобільним_роботом\\build/build_opt.h",
-        "@d:\\Education\\Диплом_АСР_мобільним_роботом\\build/file_opts",
-        "d:\\Education\\Диплом_АСР_мобільним_роботом\\build\\sketch\\Диплом_АСР_мобільним_роботом.ino.cpp",
+        "@D:\\Education\\Диплом_АСР_мобільним_роботом\\build/build_opt.h",
+        "@D:\\Education\\Диплом_АСР_мобільним_роботом\\build/file_opts",
+        "D:\\Education\\Диплом_АСР_мобільним_роботом\\build\\sketch\\Диплом_АСР_мобільним_роботом.ino.cpp",
         "-o",
-        "d:\\Education\\Диплом_АСР_мобільним_роботом\\build\\sketch\\Диплом_АСР_мобільним_роботом.ino.cpp.o"
+        "D:\\Education\\Диплом_АСР_мобільним_роботом\\build\\sketch\\Диплом_АСР_мобільним_роботом.ino.cpp.o"
       ],
       "defines": [
         "F_CPU=240000000L",
