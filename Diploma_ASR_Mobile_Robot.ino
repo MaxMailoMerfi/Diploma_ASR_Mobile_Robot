@@ -18,36 +18,51 @@
 #define HREF_GPIO_NUM 23
 #define PCLK_GPIO_NUM 22
 
-// ========== Налаштування послідовного порту ==========
+// ========== UART ==========
 #define SERIAL_BAUD 115200
 
-// ========== Параметри розпізнавання ліній ==========
+// ========== Параметри розпізнавання ==========
 #define SCAN_ROW_RATIO 0.75
 #define LINE_THRESHOLD 100
 #define IMAGE_WIDTH 320
 #define IMAGE_HEIGHT 240
 #define CENTER_X (IMAGE_WIDTH / 2)
 
+// ===== Нові параметри надійності =====
+#define MIN_DARK_PIXELS 15    // Мінімум темних пікселів, щоб вважати лінію знайденою
+                              // (6 — це шум; 15 — уже схоже на лінію)
+#define MAX_GAP_PIXELS 12     // Максимальний розрив між сусідніми темними пікселями,
+                              // щоб вони вважалися однією лінією (а не двома плямами)
+#define DEAD_ZONE 6           // Мертва зона: якщо |error| < 6 — їдемо прямо (без тремтіння)
+#define MAX_JUMP_PER_FRAME 40 // Наскільки linePos може стрибнути за один кадр
+                              // (захист від викидів від тіней/країв)
+
 // ========== Параметри керування ==========
 #define BASE_SPEED 80
 #define KP 0.5f
 #define MAX_STEER 60
+#define LOST_SPEED_FACTOR 0.5f // При втраті лінії — сповільнюємось до 50% швидкості
 
-// ========== Прапорці режимів ==========
-#define DEBUG_MODE true     // true = виводити в USB-серіал, false = тихо
-#define SEND_TO_UART2 false // true = надсилати пакети на Arduino (коли підключите)
-#define PRINT_RAW_ROW false // true = виводити сирі значення пікселів (дуже багато)
+// ========== Прапорці ==========
+#define DEBUG_MODE true
+#define SEND_TO_UART2 false
+#define PRINT_RAW_ROW false
+
+// ========== Стан між кадрами ==========
+static int prevLinePos = CENTER_X; // Позиція лінії в попередньому кадрі
+static int lastKnownDirection = 0; // -1 = ліворуч, 0 = прямо, +1 = праворуч
+static bool wasLost = false;       // Чи була лінія втрачена в попередньому кадрі
 
 void setup()
 {
     Serial.begin(115200);
     delay(500);
-    Serial.println();
-    Serial.println("========================================");
-    Serial.println(" ESP32-CAM Line Follower - DEBUG MODE");
-    Serial.println("========================================");
 
-    // Ініціалізація камери (режим сірого зображення)
+    Serial.println();
+    Serial.println("==========================================");
+    Serial.println(" ESP32-CAM Line Follower - DEBUG MODE");
+    Serial.println("==========================================");
+
     camera_config_t config;
     config.ledc_channel = LEDC_CHANNEL_0;
     config.ledc_timer = LEDC_TIMER_0;
@@ -81,25 +96,63 @@ void setup()
     }
     Serial.println("[OK] Camera initialized (GRAYSCALE QVGA)");
 
-    // Ініціалізація UART2 (поки не використовується для передачі, але готуємо)
     Serial2.begin(SERIAL_BAUD, SERIAL_8N1, -1, 12);
     Serial.println("[OK] UART2 ready on GPIO12 (TX)");
-    Serial.println("[INFO] Starting line detection loop...");
-    Serial.println("----------------------------------------");
-    Serial.println("Формат виводу:");
-    Serial.println("  [n] Line:xxx Err:xxx Steer:xxx L:xxx R:xxx Dark:xxx");
-    Serial.println("  Line  = позиція центру лінії в пікселях (0-319)");
-    Serial.println("  Err   = відхилення від центру (-160...+159)");
-    Serial.println("  Steer = величина коригування");
-    Serial.println("  L/R   = швидкість лівого та правого коліс");
-    Serial.println("  Dark  = кількість темних пікселів у рядку сканування");
-    Serial.println("----------------------------------------");
+    Serial.println("------------------------------------------");
+    Serial.println("Формат: [n] LINE:pos DIR:напрямок ERR:x L:x R:x DARK:x");
+    Serial.println("  DIR: STRAIGHT | LEFT | RIGHT | LOST");
+    Serial.println("------------------------------------------");
+}
+
+// ===== Допоміжна: перевіряє, чи темні пікселі утворюють одну компактну групу =====
+// Повертає true, якщо максимальний розрив між сусідніми темними пікселями <= maxGap
+bool isCompactGroup(uint8_t *row, int maxGap, int minPixels)
+{
+    int count = 0;
+    int lastDark = -1;
+    int maxGapSeen = 0;
+
+    for (int x = 0; x < IMAGE_WIDTH; x++)
+    {
+        if (row[x] < LINE_THRESHOLD)
+        {
+            count++;
+            if (lastDark >= 0)
+            {
+                int gap = x - lastDark;
+                if (gap > maxGapSeen)
+                    maxGapSeen = gap;
+            }
+            lastDark = x;
+        }
+    }
+
+    if (count < minPixels)
+        return false;
+    return (maxGapSeen <= maxGap);
+}
+
+// ===== Допоміжна: повертає напрямок словами =====
+const char *directionStr(int dir)
+{
+    switch (dir)
+    {
+    case -1:
+        return "LEFT   ";
+    case 1:
+        return "RIGHT  ";
+    case 0:
+        return "STRAIGHT";
+    default:
+        return "?";
+    }
 }
 
 void loop()
 {
     static uint32_t frameCounter = 0;
     static uint32_t lastTime = 0;
+
     uint32_t now = millis();
 
     // ========== 1. Захоплення кадру ==========
@@ -116,6 +169,7 @@ void loop()
     uint8_t *rowPtr = fb->buf + (scanRow * IMAGE_WIDTH);
 
     long weightedSum = 0;
+    long weightSum = 0;
     int darkPixelCount = 0;
     int minPixel = 255;
     int maxPixel = 0;
@@ -130,68 +184,159 @@ void loop()
 
         if (pixel < LINE_THRESHOLD)
         {
-            weightedSum += x * (255 - pixel);
+            int w = 255 - pixel;
+            weightedSum += (long)x * w;
+            weightSum += w;
             darkPixelCount++;
         }
     }
 
-    // ========== 3. Обчислення позиції лінії ==========
-    int linePos = CENTER_X;
-    bool lineFound = (darkPixelCount > 5);
-    if (lineFound)
+    // ========== 3. Перевірка, чи це справді лінія (а не шум/пляма) ==========
+    bool lineFound = isCompactGroup(rowPtr, MAX_GAP_PIXELS, MIN_DARK_PIXELS);
+
+    // ========== 4. Обчислення позиції лінії з фільтрацією ==========
+    int rawLinePos = CENTER_X;
+    if (lineFound && weightSum > 0)
     {
-        linePos = (int)(weightedSum / darkPixelCount);
+        // float для точності, потім lroundf для правильного округлення
+        rawLinePos = (int)lroundf((float)weightedSum / (float)weightSum);
+
+        // Обмеження стрибка: linePos не може змінитися більше ніж на MAX_JUMP_PER_FRAME
+        int delta = rawLinePos - prevLinePos;
+        if (delta > MAX_JUMP_PER_FRAME)
+            delta = MAX_JUMP_PER_FRAME;
+        if (delta < -MAX_JUMP_PER_FRAME)
+            delta = -MAX_JUMP_PER_FRAME;
+        rawLinePos = prevLinePos + delta;
+
+        prevLinePos = rawLinePos;
+        wasLost = false;
+    }
+    else
+    {
+        // Лінію втрачено
+        wasLost = true;
     }
 
     esp_camera_fb_return(fb);
 
-    // ========== 4. Обчислення керування ==========
-    int error = linePos - CENTER_X;
-    int steer = (int)(error * KP);
-    steer = constrain(steer, -MAX_STEER, MAX_STEER);
+    // ========== 5. Обчислення похибки з мертвою зоною ==========
+    int error = 0;
+    int direction = 0; // -1 = ліворуч, 0 = прямо, +1 = праворуч
 
-    int leftSpeed = BASE_SPEED - steer;
-    int rightSpeed = BASE_SPEED + steer;
-    leftSpeed = constrain(leftSpeed, -127, 127);
-    rightSpeed = constrain(rightSpeed, -127, 127);
+    if (lineFound)
+    {
+        error = rawLinePos - CENTER_X;
 
-    // ========== 5. Вивід у серійний порт ==========
+        // Мертва зона: малі похибки ігноруємо, щоб робот не тремтів
+        if (abs(error) < DEAD_ZONE)
+        {
+            error = 0;
+            direction = 0;
+        }
+        else if (error < 0)
+        {
+            direction = -1;
+        }
+        else
+        {
+            direction = 1;
+        }
+
+        lastKnownDirection = direction;
+    }
+    else
+    {
+        // Лінію втрачено: повертаємось у бік, де вона була востаннє,
+        // але повільно (щоб не "вилетіти" з траси)
+        direction = lastKnownDirection;
+        error = lastKnownDirection * CENTER_X; // максимальна похибка в бік останньої лінії
+    }
+
+    // ========== 6. Обчислення швидкостей ==========
+    int steer = 0;
+    int leftSpeed, rightSpeed;
+
+    if (lineFound)
+    {
+        steer = (int)lroundf(error * KP); // lroundf — правильне округлення
+        steer = constrain(steer, -MAX_STEER, MAX_STEER);
+
+        leftSpeed = BASE_SPEED - steer;
+        rightSpeed = BASE_SPEED + steer;
+
+        leftSpeed = constrain(leftSpeed, -127, 127);
+        rightSpeed = constrain(rightSpeed, -127, 127);
+    }
+    else
+    {
+        // При втраті лінії — повільний пошук у бік останньої лінії
+        int searchSpeed = (int)(BASE_SPEED * LOST_SPEED_FACTOR);
+        if (lastKnownDirection < 0)
+        {
+            leftSpeed = 0;
+            rightSpeed = searchSpeed;
+        }
+        else if (lastKnownDirection > 0)
+        {
+            leftSpeed = searchSpeed;
+            rightSpeed = 0;
+        }
+        else
+        {
+            leftSpeed = 0;
+            rightSpeed = 0;
+        } // стоп
+    }
+
+    // ========== 7. Вивід у серіал ==========
     if (DEBUG_MODE)
     {
         frameCounter++;
 
-        // Компактний рядок кожного кадру
-        Serial.printf("[%lu] Line:%d Err:%d Steer:%d L:%d R:%d Dark:%d",
-                      frameCounter, linePos, error, steer, leftSpeed, rightSpeed, darkPixelCount);
+        const char *dirStr = lineFound ? directionStr(direction) : "LOST   ";
+
+        Serial.printf("[%lu] LINE:%3d DIR:%s ERR:%+4d L:%+4d R:%+4d DARK:%3d",
+                      frameCounter,
+                      lineFound ? rawLinePos : -1,
+                      dirStr,
+                      lineFound ? error : 0,
+                      leftSpeed,
+                      rightSpeed,
+                      darkPixelCount);
 
         if (!lineFound)
-        {
-            Serial.print("  <-- LINE LOST!");
-        }
+            Serial.print("  <-- LOST, searching ");
+        if (!lineFound && lastKnownDirection < 0)
+            Serial.print("LEFT");
+        if (!lineFound && lastKnownDirection > 0)
+            Serial.print("RIGHT");
+        if (!lineFound && lastKnownDirection == 0)
+            Serial.print("(stop)");
         Serial.println();
 
-        // Додаткова діагностика кожні 20 кадрів
         if (frameCounter % 20 == 0)
         {
-            float fps = 20000.0f / (now - lastTime); // 20 кадрів / час
+            // Правильний FPS: перший вимір — після 20 кадрів від старту
+            float fps = 0;
+            if (lastTime > 0)
+                fps = 20000.0f / (now - lastTime);
             lastTime = now;
-            Serial.printf("  [STATS] FPS:%.1f MinPixel:%d MaxPixel:%d Threshold:%d\n",
-                          fps, minPixel, maxPixel, LINE_THRESHOLD);
+            Serial.printf("  [STATS] FPS:%.1f Min:%d Max:%d Thr:%d Compact:%s\n",
+                          fps, minPixel, maxPixel, LINE_THRESHOLD,
+                          lineFound ? "YES" : "NO");
         }
 
-        // Сирий рядок пікселів (для глибокого відлагодження, дуже об'ємно)
         if (PRINT_RAW_ROW)
         {
             Serial.print("  RAW: ");
             for (int x = 0; x < IMAGE_WIDTH; x += 8)
-            { // кожен 8-й піксель
                 Serial.printf("%3d ", rowPtr[x]);
-            }
             Serial.println();
         }
     }
 
-    // ========== 6. Відправка на Arduino (поки вимкнено) ==========
+    // ========== 8. Відправка на Arduino ==========
     if (SEND_TO_UART2)
     {
         uint8_t packet[6];
@@ -204,5 +349,5 @@ void loop()
         Serial2.write(packet, 6);
     }
 
-    delay(50); // ~20 Гц
+    delay(50);
 }
